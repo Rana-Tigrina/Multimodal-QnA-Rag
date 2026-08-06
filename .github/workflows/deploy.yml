@@ -1,0 +1,24 @@
+# Name of this workflow
+name: Deploy to Render
+
+# When should this run?
+on:
+  push:
+    branches:
+      - main  # only when you push to main branch
+
+# What should it do?
+jobs:
+  deploy:
+    # Use Ubuntu machine to run this
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1 - Download your code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2 - Trigger Render deployment
+      - name: Deploy to Render
+        run: |
+          curl "${{ secrets.RENDER_DEPLOY_HOOK }}"

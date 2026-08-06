@@ -1,0 +1,11 @@
+app/qdrant_storage
+app/__pycache__
+app/output
+app/.env
+.env
+venv
+.git
+*.pyc
+*.pyo
+frontend/node_modules
+frontend/.next
