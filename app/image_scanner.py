@@ -67,10 +67,12 @@ def load_docling():
 
     logger.info("Loading Docling pipeline...")
 
-    # Use OCR-optimized pipeline
+    # Use OCR-optimized pipeline with timeouts
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = True
     pipeline_options.do_table_structure = True
+    # Limit OCR to prevent hanging on complex images
+    pipeline_options.ocr_options = None  # Use defaults but we'll add timeout at call level
 
     converter = DocumentConverter()
     logger.info("Docling pipeline ready")
@@ -295,20 +297,44 @@ def scan_single_image(filepath: Path) -> dict:
     """
     Modular function to scan a single image file via Docling / Gemini Vision / PIL.
     Used for live file uploads and embedded PDF/DOCX images.
+    Includes timeout protection to prevent hanging on complex OCR operations.
     """
+    import signal
+    
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Docling OCR timed out after 30 seconds for {filepath.name}")
+    
+    # Set timeout for Docling operation
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(30)  # 30 second timeout for OCR
+    
     try:
         converter = load_docling()
         res = scan_image(filepath, converter)
         logger.info(f"🛠️ Scanned '{filepath.name}' using DOCLING OCR")
+        signal.alarm(0)  # Cancel alarm
         return res
+    except TimeoutError as e:
+        signal.alarm(0)  # Cancel alarm
+        logger.warning(f"⏰ {e}. Falling back to Gemini Vision OCR...")
     except Exception as e:
+        signal.alarm(0)  # Cancel alarm
         logger.info(f"Docling fallback for {filepath.name} ({e}). Attempting Gemini Vision OCR...")
 
-    # Secondary Fallback: Gemini Vision OCR
-    gemini_res = scan_with_gemini_vision(filepath)
-    if gemini_res:
-        logger.info(f"🌐 Scanned '{filepath.name}' using GEMINI VISION API")
-        return gemini_res
+    # Secondary Fallback: Gemini Vision OCR (with its own timeout)
+    signal.alarm(20)  # 20 second timeout for Gemini
+    try:
+        gemini_res = scan_with_gemini_vision(filepath)
+        signal.alarm(0)  # Cancel alarm
+        if gemini_res:
+            logger.info(f"🌐 Scanned '{filepath.name}' using GEMINI VISION API")
+            return gemini_res
+    except TimeoutError:
+        signal.alarm(0)
+        logger.warning(f"⏰ Gemini Vision timed out after 20 seconds for {filepath.name}")
+    except Exception as e:
+        signal.alarm(0)
+        logger.warning(f"Gemini Vision fallback failed for {filepath.name}: {e}")
 
     # Tertiary Fallback: PIL image specs
     try:

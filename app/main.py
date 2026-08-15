@@ -224,22 +224,6 @@ def llm_call(messages: list, max_tokens: int = 200, stream: bool = False):
 
 
 # ══════════════════════════════════════════════════════════════════
-# QUERY CLASSIFIER
-# ══════════════════════════════════════════════════════════════════
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-class AskRequest(BaseModel):
-    question: str
-    history: list[ChatMessage] = []
-
-class UrlIngestRequest(BaseModel):
-    url: str
-
-
-# ══════════════════════════════════════════════════════════════════
 # QUERY CLASSIFIER & REWRITER
 # ══════════════════════════════════════════════════════════════════
 
@@ -251,8 +235,17 @@ def is_greeting(question: str) -> bool:
 
 
 def rewrite_query(question: str, history: list[ChatMessage]) -> str:
+    """
+    Rewrite user query for better retrieval using conversation context.
+    Includes timeout protection to prevent hanging.
+    """
     question = question.strip() if question else ""
     if not question:
+        return question
+
+    # Skip LLM rewrite for simple questions to save time and reduce failures
+    if len(question.split()) < 4 and not history:
+        logger.info(f"Using original query (short): '{question}'")
         return question
 
     history_text = ""
@@ -284,7 +277,7 @@ def rewrite_query(question: str, history: list[ChatMessage]) -> str:
         return final_query
 
     except Exception as e:
-        logger.warning(f"Rewrite failed: {e}")
+        logger.warning(f"Rewrite failed: {e}, using original query")
         return question
 
 
@@ -320,23 +313,31 @@ def build_sparse_vector(text: str) -> tuple[list[int], list[float]]:
 # ══════════════════════════════════════════════════════════════════
 
 def retrieve_chunks(question: str, top_k: int = RETRIEVAL_TOP_K_EXPANDED) -> tuple[list[dict], float]:
+    """
+    Retrieve relevant chunks from Qdrant using hybrid search (dense + sparse).
+    Includes error handling and fallbacks.
+    """
     question = question.strip() if question else ""
     if not question:
         return [], 0.0
 
     # ── Step 1: Embed query with Gemini ─────────────────────────
-    embed_result = genai.embed_content(
-
-        model=EMBEDDING_MODEL,
-        content=question,
-        task_type="retrieval_query",
-    )
-    query_vec = embed_result["embedding"]
+    try:
+        embed_result = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=question,
+            task_type="retrieval_query",
+        )
+        query_vec = embed_result["embedding"]
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
+        return [], 0.0
 
     # ── Step 2: Build sparse vector for BM25 ────────────────────
     sparse_indices, sparse_values = build_sparse_vector(question)
 
     # ── Step 3: Dense search ────────────────────────────────────
+    dense_results = []
     try:
         dense_results = qdrant.query_points(
             collection_name = QDRANT_COLLECTION,
@@ -346,15 +347,20 @@ def retrieve_chunks(question: str, top_k: int = RETRIEVAL_TOP_K_EXPANDED) -> tup
             with_payload    = True,
         ).points
     except Exception as e:
-        logger.warning(f"Dense search failed: {e}, falling back to basic search")
-        dense_results = qdrant.query_points(
-            collection_name = QDRANT_COLLECTION,
-            query           = query_vec,
-            limit           = top_k,
-            with_payload    = True,
-        ).points
+        logger.warning(f"Dense search failed: {e}, trying without 'using' parameter")
+        try:
+            dense_results = qdrant.query_points(
+                collection_name = QDRANT_COLLECTION,
+                query           = query_vec,
+                limit           = top_k,
+                with_payload    = True,
+            ).points
+        except Exception as e2:
+            logger.error(f"Dense search completely failed: {e2}")
+            dense_results = []
 
     # ── Step 4: Sparse search (BM25) ────────────────────────────
+    sparse_results = []
     try:
         from qdrant_client.models import SparseVector
         sparse_results = qdrant.query_points(
@@ -545,6 +551,9 @@ def sse(event_type: str, data: dict) -> str:
 
 @app.post("/ingest/file")
 async def ingest_file(file: UploadFile = File(...)):
+    import tempfile
+    import shutil
+    
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -552,20 +561,30 @@ async def ingest_file(file: UploadFile = File(...)):
             detail=f"Unsupported file format '{ext}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
-    temp_path = UPLOAD_DIR / f"{int(time.time())}_{file.filename}"
-    with open(temp_path, "wb") as buffer:
+    # Create temp file with proper cleanup
+    temp_path = None
+    try:
+        temp_fd, temp_path = tempfile.mkstemp(suffix=ext, prefix="upload_")
+        os.close(temp_fd)
+        
         content = await file.read()
-        buffer.write(content)
+        with open(temp_path, "wb") as buffer:
+            buffer.write(content)
 
-    return StreamingResponse(
-        ingest_file_stream(temp_path, file.filename),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        }
-    )
+        return StreamingResponse(
+            ingest_file_stream(Path(temp_path), file.filename),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
 
 
 @app.post("/ingest/url")
