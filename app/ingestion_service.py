@@ -138,26 +138,33 @@ def ingest_file_stream(filepath: Path, original_filename: str) -> Generator[str,
         yield sse_event("chunking", f"Structuring chunks from {doc_title}...", 30)
         chunks = chunk_document_content(raw_text, doc_title, source_url)
 
-        # Process embedded/uploaded images with OCR
+        # Process embedded/uploaded images with OCR (with timeout protection)
         if image_paths:
-            yield sse_event("ocr", f"Running Docling OCR on {len(image_paths)} image(s)...", 45)
-            for img_path in image_paths:
-                res = scan_single_image(img_path)
-                if not res.get("is_decorative") and res.get("image_content"):
-                    img_chunk = base_chunk(
-                        content=res["image_content"],
-                        chunk_type="image",
-                        heading=f"Image: {img_path.name}",
-                        heading_level=2,
-                        doc_title=doc_title,
-                        section=f"Image in {doc_title}",
-                        breadcrumb=f"{doc_title} > Images",
-                        source_url=source_url,
-                        parent_doc=doc_title,
-                    )
-                    img_chunk["image_file"] = img_path.name
-                    img_chunk["image_content"] = res["image_content"]
-                    chunks.append(img_chunk)
+            yield sse_event("ocr", f"Running OCR on {len(image_paths)} image(s)...", 45)
+            for idx, img_path in enumerate(image_paths):
+                try:
+                    res = scan_single_image(img_path)
+                    if not res.get("is_decorative") and res.get("image_content"):
+                        img_chunk = base_chunk(
+                            content=res["image_content"],
+                            chunk_type="image",
+                            heading=f"Image: {img_path.name}",
+                            heading_level=2,
+                            doc_title=doc_title,
+                            section=f"Image in {doc_title}",
+                            breadcrumb=f"{doc_title} > Images",
+                            source_url=source_url,
+                            parent_doc=doc_title,
+                        )
+                        img_chunk["image_file"] = img_path.name
+                        img_chunk["image_content"] = res["image_content"]
+                        chunks.append(img_chunk)
+                    # Report progress for each image
+                    ocr_progress = 45 + int(((idx + 1) / len(image_paths)) * 15)
+                    yield sse_event("ocr", f"Processed {idx + 1}/{len(image_paths)} images", ocr_progress)
+                except Exception as e:
+                    logger.warning(f"Failed to scan image {img_path.name}: {e}")
+                    continue
 
         if not chunks:
             yield sse_event("error", "No readable text or images found in file.", 100)
