@@ -13,8 +13,16 @@ export function useChat() {
   const [dark, setDark] = useState(false);
   const [documents, setDocuments] = useState<IngestedDocument[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<string>("groq");
   const messagesRef = useRef<Message[]>([]);
   const nextId = useRef(1);
+
+  const handleSelectModel = useCallback((model: string) => {
+    setSelectedModel(model);
+    try {
+      localStorage.setItem("universal_rag_model", model);
+    } catch {}
+  }, []);
 
   const fetchDocuments = useCallback(async () => {
     try {
@@ -22,10 +30,12 @@ export function useChat() {
       if (res.ok) {
         const data = await res.json();
         setDocuments(data.documents || []);
+        return true;
       }
     } catch (e) {
       console.error("Failed to fetch documents:", e);
     }
+    return false;
   }, []);
 
   const deleteDocument = useCallback(async (docTitle: string) => {
@@ -41,10 +51,20 @@ export function useChat() {
     }
   }, [fetchDocuments]);
 
-  // Load from localStorage & fetch docs on mount
+  // Load from localStorage & fetch docs on mount with retries
   useEffect(() => {
     fetchDocuments();
+
+    // Auto-retry in case backend was restarting
+    const t1 = setTimeout(fetchDocuments, 2000);
+    const t2 = setTimeout(fetchDocuments, 5000);
+
+    const onFocus = () => fetchDocuments();
+    window.addEventListener("focus", onFocus);
+
     try {
+      const savedModel = localStorage.getItem("universal_rag_model");
+      if (savedModel) setSelectedModel(savedModel);
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
@@ -54,6 +74,12 @@ export function useChat() {
           : 1;
       }
     } catch {}
+
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [fetchDocuments]);
 
   // Save to localStorage on every message change
@@ -95,7 +121,7 @@ export function useChat() {
       const res = await fetch(`${API_URL}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, history }),
+        body: JSON.stringify({ question: q, history, provider: selectedModel }),
       });
 
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -156,5 +182,7 @@ export function useChat() {
     sendQuestion,
     regenerate,
     clearChat,
+    selectedModel,
+    setSelectedModel: handleSelectModel,
   };
 }

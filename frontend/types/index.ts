@@ -4,6 +4,8 @@ export interface Source {
   url: string;
   type: string;
   text?: string;
+  snippet?: string;
+  score?: number;
 }
 
 export interface Message {

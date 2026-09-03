@@ -7,6 +7,8 @@ interface TopBarProps {
   clearChat: () => void;
   docCount: number;
   onOpenModal: () => void;
+  selectedModel: string;
+  setSelectedModel: (m: string) => void;
 }
 
 export default function TopBar({
@@ -16,6 +18,8 @@ export default function TopBar({
   clearChat,
   docCount,
   onOpenModal,
+  selectedModel,
+  setSelectedModel,
 }: TopBarProps) {
   return (
     <div className={`flex items-center justify-between px-4 py-3 border-b flex-shrink-0 ${dark ? "border-white/10 bg-[#212121]" : "border-black/8 bg-white"}`}>
@@ -25,6 +29,53 @@ export default function TopBar({
         <span className={`text-sm font-semibold tracking-tight ${dark ? "text-white/90" : "text-gray-900"}`}>
           Universal AI Knowledge Assistant
         </span>
+      </div>
+
+      {/* Center: Model Selector Pill */}
+      <div className={`flex items-center p-0.5 rounded-xl border text-xs font-medium ${
+        dark ? "bg-white/[0.04] border-white/10" : "bg-gray-100 border-gray-200"
+      }`}>
+        <button
+          onClick={() => setSelectedModel("groq")}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg transition-all ${
+            selectedModel === "groq"
+              ? dark
+                ? "bg-purple-600 text-white shadow-sm font-semibold"
+                : "bg-white text-purple-700 shadow-sm font-semibold"
+              : dark
+                ? "text-white/60 hover:text-white"
+                : "text-gray-600 hover:text-gray-900"
+          }`}
+          title="Cloud inference via Groq (zero reasoning overhead, 4096 tokens)"
+        >
+          <span>⚡ Qwen 3.8 27B</span>
+          <span className={`text-[10px] px-1 py-0.2 rounded font-bold ${
+            selectedModel === "groq"
+              ? dark ? "bg-white/20 text-white" : "bg-purple-100 text-purple-800"
+              : "opacity-60"
+          }`}>Cloud</span>
+        </button>
+
+        <button
+          onClick={() => setSelectedModel("llamacpp")}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg transition-all ${
+            selectedModel === "llamacpp"
+              ? dark
+                ? "bg-emerald-600 text-white shadow-sm font-semibold"
+                : "bg-white text-emerald-700 shadow-sm font-semibold"
+              : dark
+                ? "text-white/60 hover:text-white"
+                : "text-gray-600 hover:text-gray-900"
+          }`}
+          title="100% offline llama.cpp inference using Ling-3.0-tiny GGUF (Q4_K_M)"
+        >
+          <span>💻 Ling 3.0 Tiny</span>
+          <span className={`text-[10px] px-1 py-0.2 rounded font-bold ${
+            selectedModel === "llamacpp"
+              ? dark ? "bg-white/20 text-white" : "bg-emerald-100 text-emerald-800"
+              : "opacity-60"
+          }`}>Local</span>
+        </button>
       </div>
 
       {/* Right */}

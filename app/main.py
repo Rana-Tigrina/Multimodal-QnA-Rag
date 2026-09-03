@@ -1,70 +1,85 @@
 """
 IITM BS RAG Pipeline — Stage 11: FastAPI Backend
 =================================================
-Provider: Google Gemini (text-embedding-004, free, no card needed)
+Provider: Local all-MiniLM-L6-v2 embeddings + Local ChromaDB + Groq LLM
 
 Endpoints:
-  POST /ask        → streaming SSE answer
-  GET  /health     → check all services are up
+  POST /ask            → streaming SSE answer
+  GET  /health         → check all services are up
+  POST /ingest/file    → multi-modal document ingestion (streaming SSE)
+  POST /ingest/url     → web page scraping ingestion (streaming SSE)
+  GET  /documents      → list indexed documents
+  DELETE /documents/{t}→ delete indexed document
 
 Run:
   uvicorn main:app --reload --port 8000
 """
 
+import sys
 import os
+import re
 import json
 import hashlib
 import asyncio
 import logging
 import time
 from pathlib import Path
-import google.generativeai as genai
 
-from openai import OpenAI
-from qdrant_client import QdrantClient
-from qdrant_client.models import ScoredPoint
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from config import (
-    LLM_BASE_URL,
-    LLM_API_KEY,
-    LLM_MODEL,
-    LLM_FALLBACK_MODELS,
     LLM_PROVIDER,
-    GEMINI_API_KEY,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    LOCAL_MODEL_FILE,
     EMBEDDING_MODEL,
-    RERANKER_MODEL,
-    RERANKER_TOP_K,
-    QDRANT_HOST,
-    QDRANT_PORT,
-    QDRANT_URL,
-    QDRANT_API_KEY,
-    QDRANT_COLLECTION,
+    CHROMA_PERSIST_DIR,
+    CHROMA_COLLECTION,
     RETRIEVAL_TOP_K,
     RERANK_TOP_K,
+    CONFIDENCE_THRESHOLD,
     VECTOR_WEIGHT,
     BM25_WEIGHT,
-    RAG_SYSTEM_PROMPT,
-    STREAM_RESPONSE,
     LOG_LEVEL,
     LOG_FORMAT,
     UPLOAD_DIR,
+    IMAGES_DIR,
     ALLOWED_EXTENSIONS,
 )
 
-from ingestion_service import ingest_file_stream, ingest_url_stream
-from uploader import list_indexed_documents, delete_document_chunks, get_qdrant_client
+from model_service import (
+    stream_chat_completion,
+    generate_chat_text,
+    is_local_model_downloaded,
+)
 
+from ingestion_service import ingest_file_stream, ingest_url_stream
+from scraper import scrape_url
+from chunker import chunk_document_content
+from embedder import embed_query, embed_chunk_list
+from uploader import (
+    list_indexed_documents,
+    delete_document_chunks,
+    upload_chunks_batch,
+    get_chroma_client,
+    get_chroma_collection,
+)
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger("main")
 
 MAX_HISTORY = 6
-RETRIEVAL_TOP_K_EXPANDED = 20
-CONFIDENCE_THRESHOLD = 0.3
+RETRIEVAL_TOP_K_EXPANDED = 25
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -131,23 +146,15 @@ If answer truly not in context:
 # INIT
 # ══════════════════════════════════════════════════════════════════
 
-print("Initialising Gemini client...")
-genai.configure(api_key=GEMINI_API_KEY)
-print(f"✅ Gemini ready: {EMBEDDING_MODEL}")
+print(f"✅ Local Embeddings ready: {EMBEDDING_MODEL} (384d)")
 
-print(f"Connecting to Qdrant...")
-qdrant = get_qdrant_client()
-print("✅ Qdrant database ready")
+print(f"Connecting to ChromaDB (local: {CHROMA_PERSIST_DIR.name})...")
+chroma_client = get_chroma_client()
+chroma_collection = get_chroma_collection(chroma_client)
+print(f"✅ ChromaDB database ready: '{CHROMA_COLLECTION}' ({chroma_collection.count()} chunks)")
 
-
-print(f"Initialising LLM client ({LLM_PROVIDER})...")
-llm_client = OpenAI(
-    base_url=LLM_BASE_URL,
-    api_key=LLM_API_KEY,
-    timeout=20,
-    max_retries=0,
-)
-print(f"✅ LLM client ready: {LLM_MODEL}")
+print(f"✅ Cloud LLM ready: Groq ({GROQ_MODEL}, reasoning_effort=none)")
+print(f"✅ Local LLM ready: llama.cpp ({LOCAL_MODEL_FILE}, downloaded={is_local_model_downloaded()})")
 print("✅ Backend ready\n")
 
 # ══════════════════════════════════════════════════════════════════
@@ -176,51 +183,33 @@ class ChatMessage(BaseModel):
 class AskRequest(BaseModel):
     question: str
     history: list[ChatMessage] = []
+    provider: str | None = None  # "groq" (default) or "llamacpp"
 
 class UrlIngestRequest(BaseModel):
     url: str
 
 
-
 # ══════════════════════════════════════════════════════════════════
-# LLM CALLER WITH FALLBACK + BACKOFF
+# LLM CALLER (Groq Qwen 3.8 27B / llama.cpp Ling 3.0 Tiny)
 # ══════════════════════════════════════════════════════════════════
 
-def llm_call(messages: list, max_tokens: int = 200, stream: bool = False):
-    models_to_try = [LLM_MODEL] + LLM_FALLBACK_MODELS
-    last_error    = None
-
-    for i, model in enumerate(models_to_try):
-        try:
-            if i > 0:
-                wait = min(2 ** i, 8)
-                logger.info(f"Waiting {wait}s before trying {model}...")
-                time.sleep(wait)
-
-            resp = llm_client.chat.completions.create(
-                model       = model,
-                messages    = messages,
-                max_tokens  = max_tokens,
-                temperature = 0.1,
-                stream      = stream,
-            )
-            if model != LLM_MODEL:
-                logger.info(f"Using fallback model: {model}")
-            return resp
-
-        except Exception as e:
-            err = str(e).lower()
-            if any(x in err for x in [
-                "rate_limit", "429", "decommissioned",
-                "model_not_found", "timed out", "timeout",
-                "connection", "read timed out"
-            ]):
-                logger.warning(f"Model {model} failed ({type(e).__name__}), trying next...")
-                last_error = e
-                continue
-            raise e
-
-    raise Exception(f"All LLM models exhausted. Last error: {last_error}")
+def llm_call(messages: list, max_tokens: int = 200, stream: bool = False, provider: str = None):
+    if stream:
+        return stream_chat_completion(
+            messages=messages,
+            provider=provider,
+            temperature=0.66,
+            max_tokens=max_tokens,
+            top_p=0.95,
+        )
+    else:
+        return generate_chat_text(
+            messages=messages,
+            provider=provider,
+            temperature=0.66,
+            max_tokens=max_tokens,
+            top_p=0.95,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -234,7 +223,7 @@ def is_greeting(question: str) -> bool:
     return q in GREETINGS or any(q == g or q.startswith(g + " ") for g in GREETINGS)
 
 
-def rewrite_query(question: str, history: list[ChatMessage]) -> str:
+def rewrite_query(question: str, history: list[ChatMessage], provider: str = None) -> str:
     """
     Rewrite user query for better retrieval using conversation context.
     Includes timeout protection to prevent hanging.
@@ -243,7 +232,6 @@ def rewrite_query(question: str, history: list[ChatMessage]) -> str:
     if not question:
         return question
 
-    # Skip LLM rewrite for simple questions to save time and reduce failures
     if len(question.split()) < 4 and not history:
         logger.info(f"Using original query (short): '{question}'")
         return question
@@ -267,11 +255,13 @@ def rewrite_query(question: str, history: list[ChatMessage]) -> str:
             prompt += f"Conversation so far:\n{history_text}\n\n"
         prompt += f"Question to rewrite: {question}"
 
-        resp = llm_call(
+        rewritten = generate_chat_text(
             messages=[{"role": "user", "content": prompt}],
+            provider=provider,
+            temperature=0.66,
             max_tokens=100,
-        )
-        rewritten = resp.choices[0].message.content.strip() if resp and resp.choices else ""
+            top_p=0.95,
+        ).strip()
         final_query = rewritten if (rewritten and len(rewritten) > 3) else question
         logger.info(f"Rewritten: '{question}' → '{final_query}'")
         return final_query
@@ -282,160 +272,184 @@ def rewrite_query(question: str, history: list[ChatMessage]) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# SPARSE VECTOR BUILDER (BM25 approximation)
+# KEYWORD & HYBRID RETRIEVAL (ChromaDB + TF/BM25)
 # ══════════════════════════════════════════════════════════════════
 
-def build_sparse_vector(text: str) -> tuple[list[int], list[float]]:
+def compute_keyword_similarity(query: str, doc_text: str) -> float:
     import re
     from collections import Counter
 
-    words = re.findall(r'\b[a-z]{2,}\b', text.lower())
-    if not words:
-        return [0], [0.0]
+    q_words = re.findall(r'\b[a-z0-9]{2,}\b', query.lower())
+    d_words = re.findall(r'\b[a-z0-9]{2,}\b', doc_text.lower())
+    if not q_words or not d_words:
+        return 0.0
 
-    tf    = Counter(words)
-    total = len(words)
+    d_counts = Counter(d_words)
+    total_d = len(d_words)
 
-    index_map = {}
-    for word, count in tf.items():
-        word_idx = int(hashlib.md5(word.encode()).hexdigest()[:6], 16) % 100000
-        tf_score = count / total
-        if word_idx in index_map:
-            index_map[word_idx] += tf_score
-        else:
-            index_map[word_idx] = tf_score
-
-    return list(index_map.keys()), [float(v) for v in index_map.values()]
+    matches = sum(d_counts[w] for w in q_words if w in d_counts)
+    return min(1.0, (matches / total_d) * 5.0)
 
 
-# ══════════════════════════════════════════════════════════════════
-# HYBRID RETRIEVAL
-# ══════════════════════════════════════════════════════════════════
+def retrieve_single_vector_and_keyword(query_text: str, top_k: int = RETRIEVAL_TOP_K_EXPANDED) -> list[dict]:
+    query_text = query_text.strip()
+    if not query_text:
+        return []
+    query_vec = embed_query(query_text)
+    if not query_vec:
+        logger.error(f"Query vectorization failed for '{query_text[:50]}'")
+        return []
 
-def retrieve_chunks(question: str, top_k: int = RETRIEVAL_TOP_K_EXPANDED) -> tuple[list[dict], float]:
+    collection = get_chroma_collection()
+    total_docs = collection.count()
+    if total_docs == 0:
+        return []
+
+    n_results = min(top_k, total_docs)
+    try:
+        results = collection.query(
+            query_embeddings=[query_vec],
+            n_results=n_results,
+            include=["metadatas", "documents", "distances"]
+        )
+    except Exception as e:
+        logger.error(f"ChromaDB query failed: {e}")
+        return []
+
+    ids = results.get("ids", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    documents = results.get("documents", [[]])[0]
+    distances = results.get("distances", [[]])[0]
+
+    scored = []
+    for chunk_id, meta, doc_text, dist in zip(ids, metadatas, documents, distances):
+        dense_sim = max(0.0, 1.0 - float(dist)) if dist is not None else 0.0
+        content_for_kw = f"{doc_text} {meta.get('heading', '')} {meta.get('section', '')}"
+        kw_sim = compute_keyword_similarity(query_text, content_for_kw)
+        hybrid_score = (VECTOR_WEIGHT * dense_sim) + (BM25_WEIGHT * kw_sim)
+
+        refs = meta.get("references", "[]")
+        if isinstance(refs, str):
+            try:
+                refs = json.loads(refs)
+            except Exception:
+                refs = []
+
+        hyde = meta.get("hyde_questions", "[]")
+        if isinstance(hyde, str):
+            try:
+                hyde = json.loads(hyde)
+            except Exception:
+                hyde = []
+
+        chunk_dict = dict(meta)
+        chunk_dict["chunk_id"] = chunk_id
+        chunk_dict["content"] = doc_text
+        chunk_dict["references"] = refs
+        chunk_dict["hyde_questions"] = hyde
+        chunk_dict["dense_score"] = dense_sim
+        chunk_dict["keyword_score"] = kw_sim
+        chunk_dict["rerank_score"] = hybrid_score
+        scored.append(chunk_dict)
+    return scored
+
+
+def retrieve_chunks(question: str, rewritten_query: str = "", top_k: int = RETRIEVAL_TOP_K_EXPANDED, url_filter: list[str] = None) -> tuple[list[dict], float]:
     """
-    Retrieve relevant chunks from Qdrant using hybrid search (dense + sparse).
-    Includes error handling and fallbacks.
+    Retrieve relevant chunks from ChromaDB using multi-query hybrid search (dense embeddings + BM25 keyword matching).
+    Searches using both user question and the rewritten query, fusing results for maximum recall.
+    If specific URLs are provided in url_filter, their chunks are given top priority.
     """
     question = question.strip() if question else ""
-    if not question:
+    rewritten_query = rewritten_query.strip() if rewritten_query else ""
+    if not question and not rewritten_query and not url_filter:
         return [], 0.0
 
-    # ── Step 1: Embed query with Gemini ─────────────────────────
-    try:
-        embed_result = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=question,
-            task_type="retrieval_query",
-        )
-        query_vec = embed_result["embedding"]
-    except Exception as e:
-        logger.error(f"Embedding failed: {e}")
-        return [], 0.0
+    candidates_map = {}
 
-    # ── Step 2: Build sparse vector for BM25 ────────────────────
-    sparse_indices, sparse_values = build_sparse_vector(question)
-
-    # ── Step 3: Dense search ────────────────────────────────────
-    dense_results = []
-    try:
-        dense_results = qdrant.query_points(
-            collection_name = QDRANT_COLLECTION,
-            query           = query_vec,
-            using           = "dense",
-            limit           = top_k,
-            with_payload    = True,
-        ).points
-    except Exception as e:
-        logger.warning(f"Dense search failed: {e}, trying without 'using' parameter")
+    # Priority: If specific URLs were referenced, include their chunks with top priority
+    if url_filter:
         try:
-            dense_results = qdrant.query_points(
-                collection_name = QDRANT_COLLECTION,
-                query           = query_vec,
-                limit           = top_k,
-                with_payload    = True,
-            ).points
-        except Exception as e2:
-            logger.error(f"Dense search completely failed: {e2}")
-            dense_results = []
+            coll = get_chroma_collection()
+            for target_u in url_filter:
+                u_res = coll.get(where={"source_url": target_u}, include=["metadatas", "documents"])
+                u_metas = u_res.get("metadatas", [])
+                u_docs = u_res.get("documents", [])
+                u_ids = u_res.get("ids", [])
+                for cid, meta, doc in zip(u_ids, u_metas, u_docs):
+                    if meta:
+                        c_dict = dict(meta)
+                        c_dict["chunk_id"] = cid
+                        c_dict["content"] = doc
+                        c_dict["rerank_score"] = 0.95
+                        candidates_map[cid] = c_dict
+        except Exception as e:
+            logger.warning(f"Failed to fetch chunks for target URL: {e}")
 
-    # ── Step 4: Sparse search (BM25) ────────────────────────────
-    sparse_results = []
-    try:
-        from qdrant_client.models import SparseVector
-        sparse_results = qdrant.query_points(
-            collection_name = QDRANT_COLLECTION,
-            query           = SparseVector(indices=sparse_indices, values=sparse_values),
-            using           = "sparse",
-            limit           = top_k,
-            with_payload    = True,
-        ).points
-    except Exception as e:
-        logger.warning(f"Sparse search failed: {e}")
-        sparse_results = []
+    # Query 1: Original user question
+    if question:
+        q1_candidates = retrieve_single_vector_and_keyword(question, top_k)
+        for c in q1_candidates:
+            cid = c.get("chunk_id") or str(c.get("content", "")[:30])
+            if cid in candidates_map:
+                candidates_map[cid]["rerank_score"] = max(candidates_map[cid]["rerank_score"], c["rerank_score"])
+            else:
+                candidates_map[cid] = c
 
-    # ── Step 5: Merge dense + sparse scores ─────────────────────
-    seen_ids = {}
-    for point in dense_results:
-        seen_ids[point.id] = {"point": point, "score": point.score * VECTOR_WEIGHT}
-    for point in sparse_results:
-        if point.id in seen_ids:
-            seen_ids[point.id]["score"] += point.score * BM25_WEIGHT
-        else:
-            seen_ids[point.id] = {"point": point, "score": point.score * BM25_WEIGHT}
+    # Query 2: Rewritten query (if distinct)
+    if rewritten_query and rewritten_query.lower() != question.lower():
+        q2_candidates = retrieve_single_vector_and_keyword(rewritten_query, top_k)
+        for c in q2_candidates:
+            cid = c.get("chunk_id") or str(c.get("content", "")[:30])
+            if cid in candidates_map:
+                # Mutual candidate bonus
+                candidates_map[cid]["rerank_score"] = max(candidates_map[cid]["rerank_score"], c["rerank_score"]) + 0.1
+            else:
+                candidates_map[cid] = c
 
-    merged     = sorted(seen_ids.values(), key=lambda x: x["score"], reverse=True)
-    top_points = [m["point"] for m in merged[:top_k]]
-
-    if not top_points:
+    scored_candidates = list(candidates_map.values())
+    if not scored_candidates:
         return [], 0.0
 
-    # ── Step 6: Cross-reference expansion ───────────────────────
-    all_points   = list(top_points)
+    scored_candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+    # ── Step 4: Cross-reference expansion ───────────────────────
+    top_candidates = scored_candidates[:RERANK_TOP_K]
     ref_sections = set()
-    for point in top_points:
-        refs = point.payload.get("references", [])
+    for cand in top_candidates:
+        refs = cand.get("references", [])
         for ref in refs[:3]:
-            ref_sections.add(ref)
+            if ref and ref not in [c.get("section") for c in top_candidates]:
+                ref_sections.add(ref)
 
     if ref_sections:
         try:
-            from qdrant_client.models import Filter, FieldCondition, MatchAny
-            ref_results = qdrant.query_points(
-                collection_name = QDRANT_COLLECTION,
-                query           = query_vec,
-                using           = "dense",
-                query_filter    = Filter(
-                    must=[FieldCondition(
-                        key   = "section",
-                        match = MatchAny(any=list(ref_sections))
-                    )]
-                ),
-                limit        = 5,
-                with_payload = True,
-            ).points
-            existing_ids = {p.id for p in all_points}
-            for p in ref_results:
-                if p.id not in existing_ids:
-                    all_points.append(p)
-                    existing_ids.add(p.id)
+            collection = get_chroma_collection()
+            for section_name in list(ref_sections)[:3]:
+                ref_res = collection.get(
+                    where={"section": section_name},
+                    include=["metadatas", "documents"],
+                    limit=2
+                )
+                ref_metas = ref_res.get("metadatas", [])
+                ref_docs = ref_res.get("documents", [])
+                existing_ids = {c.get("chunk_id") for c in top_candidates}
+                for r_meta, r_doc in zip(ref_metas, ref_docs):
+                    if r_meta and r_meta.get("chunk_id") not in existing_ids:
+                        r_chunk = dict(r_meta)
+                        r_chunk["content"] = r_doc
+                        r_chunk["rerank_score"] = 0.5
+                        top_candidates.append(r_chunk)
+                        existing_ids.add(r_meta.get("chunk_id"))
         except Exception as e:
-            logger.warning(f"Cross-ref fetch failed: {e}")
+            logger.warning(f"Cross-reference expansion failed: {e}")
 
-    # ── Step 7: Return top chunks by hybrid score (no reranker) ─
-    top_score = merged[0]["score"] if merged else 0.0
-
-    chunks = []
-    for point in top_points[:RERANK_TOP_K]:
-        payload = dict(point.payload)
-        payload["rerank_score"] = float(point.score)
-        chunks.append(payload)
-
-    return chunks, top_score
+    top_score = scored_candidates[0]["rerank_score"] if scored_candidates else 0.0
+    return top_candidates, top_score
 
 
 # ══════════════════════════════════════════════════════════════════
-# CONTEXT BUILDER
+# CONTEXT BUILDER & CITATIONS
 # ══════════════════════════════════════════════════════════════════
 
 def build_context(chunks: list[dict]) -> tuple[str, list[dict], list[dict]]:
@@ -450,11 +464,17 @@ def build_context(chunks: list[dict]) -> tuple[str, list[dict], list[dict]]:
         doc_title  = chunk.get("doc_title", "")
         section    = chunk.get("section", "")
         source_url = chunk.get("source_url", "")
+        rerank_score = chunk.get("rerank_score", 0)
+
+        # Build clean snippet quote (~280 characters)
+        clean_snippet = content.replace("\r", " ").replace("\n", " ").strip()
+        clean_snippet = " ".join(clean_snippet.split())
+        if len(clean_snippet) > 280:
+            clean_snippet = clean_snippet[:280] + "..."
 
         noise_sections = [
             "this will be in effect",
             "important advisory",
-            "section index",
         ]
         is_noise = any(n in section.lower() for n in noise_sections)
 
@@ -462,15 +482,16 @@ def build_context(chunks: list[dict]) -> tuple[str, list[dict], list[dict]]:
             context_parts.append(
                 f"[SOURCE: {doc_title} — {section} | URL: {source_url}]\n{content}"
             )
-            source_key   = f"{doc_title}|{section}"
-            rerank_score = chunk.get("rerank_score", 0)
-            if source_key not in seen_sources and rerank_score > 0.4 and not is_noise:
+            source_key = f"{doc_title}|{section}"
+            if source_key not in seen_sources and not is_noise:
                 seen_sources.add(source_key)
                 sources.append({
                     "doc":     doc_title,
                     "section": section,
                     "url":     source_url,
                     "type":    "document",
+                    "snippet": clean_snippet,
+                    "score":   round(float(rerank_score), 3) if rerank_score else None,
                 })
 
         elif chunk_type == "image":
@@ -489,11 +510,16 @@ def build_context(chunks: list[dict]) -> tuple[str, list[dict], list[dict]]:
             source_key = f"{doc_title}|{section}"
             if source_key not in seen_sources:
                 seen_sources.add(source_key)
+                img_snippet = (image_content or content).replace("\r", " ").replace("\n", " ").strip()
+                if len(img_snippet) > 280:
+                    img_snippet = img_snippet[:280] + "..."
                 sources.append({
                     "doc":     doc_title,
                     "section": section,
                     "url":     source_url,
                     "type":    "image",
+                    "snippet": img_snippet,
+                    "score":   round(float(rerank_score), 3) if rerank_score else None,
                 })
 
         elif chunk_type == "reference_link":
@@ -515,6 +541,8 @@ def build_context(chunks: list[dict]) -> tuple[str, list[dict], list[dict]]:
                 "what_it_contains": what_it_contains,
                 "type":             "link",
                 "is_link":          True,
+                "snippet":          f"{what_it_contains} ({when_to_refer})",
+                "score":            round(float(rerank_score), 3) if rerank_score else None,
             })
 
         elif chunk_type == "restricted_doc":
@@ -531,8 +559,9 @@ def build_context(chunks: list[dict]) -> tuple[str, list[dict], list[dict]]:
                 "url":     link_url,
                 "type":    "restricted",
                 "note":    chunk.get("note", ""),
+                "snippet": chunk.get("note", ""),
+                "score":   round(float(rerank_score), 3) if rerank_score else None,
             })
-
 
     return "\n\n".join(context_parts), sources, images
 
@@ -553,7 +582,7 @@ def sse(event_type: str, data: dict) -> str:
 async def ingest_file(file: UploadFile = File(...)):
     import tempfile
     import shutil
-    
+
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -561,15 +590,22 @@ async def ingest_file(file: UploadFile = File(...)):
             detail=f"Unsupported file format '{ext}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
-    # Create temp file with proper cleanup
     temp_path = None
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=ext, prefix="upload_")
         os.close(temp_fd)
-        
+
         content = await file.read()
         with open(temp_path, "wb") as buffer:
             buffer.write(content)
+
+        # Also save to persistent UPLOAD_DIR for citations & document download
+        try:
+            persistent_path = UPLOAD_DIR / file.filename
+            with open(persistent_path, "wb") as buffer:
+                buffer.write(content)
+        except Exception as e:
+            logger.warning(f"Could not write copy to UPLOAD_DIR: {e}")
 
         return StreamingResponse(
             ingest_file_stream(Path(temp_path), file.filename),
@@ -585,6 +621,22 @@ async def ingest_file(file: UploadFile = File(...)):
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
         raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+
+
+@app.get("/files/{filename:path}")
+def get_uploaded_file(filename: str):
+    """Serve uploaded documents and images for citation previews and downloads."""
+    clean_name = Path(filename).name
+    candidates = [
+        UPLOAD_DIR / clean_name,
+        IMAGES_DIR / clean_name,
+        DOCS_DIR / clean_name,
+        DOCS_DIR / "linked_docs" / clean_name,
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return FileResponse(p, filename=clean_name)
+    raise HTTPException(status_code=404, detail=f"File '{clean_name}' not found")
 
 
 @app.post("/ingest/url")
@@ -632,21 +684,47 @@ async def ask(req: AskRequest):
                 yield sse("token", {"text": (
                     "Hello! 👋 I am your AI Document Knowledge Assistant.\n\n"
                     "You can upload files (PDF, DOCX, TXT, MD, Images) or paste web URLs into the Knowledge Base, "
-                    "and I will answer your questions directly from your documents!"
+                    "or even include a URL directly in your question, and I will answer directly from your content!"
                 )})
                 yield sse("done", {})
                 return
 
+            # Live URL detection: If question contains a URL, fetch & index it automatically on the fly
+            URL_REGEX = r'https?://[^\s<>"\']+|www\.[^\s<>"\']+'
+            raw_urls = re.findall(URL_REGEX, question)
+            detected_urls = []
+            if raw_urls:
+                for raw_url in raw_urls[:2]:
+                    clean_url = raw_url.rstrip(".,?!;:)'\"]")
+                    target_url = clean_url if clean_url.startswith("http") else f"https://{clean_url}"
+                    detected_urls.append(target_url)
+                    try:
+                        coll = get_chroma_collection()
+                        existing = coll.get(where={"source_url": target_url}, limit=1)
+                        if not existing or not existing.get("ids"):
+                            yield sse("status", {"text": f"Reading web content from {target_url}..."})
+                            doc_data = scrape_url(target_url)
+                            if doc_data.get("content"):
+                                u_chunks = chunk_document_content(doc_data["content"], doc_data["doc_title"], target_url)
+                                if u_chunks:
+                                    u_chunks = embed_chunk_list(u_chunks)
+                                    upload_chunks_batch(u_chunks)
+                                    logger.info(f"Auto-ingested {len(u_chunks)} chunks for URL: {target_url}")
+                    except Exception as e:
+                        logger.warning(f"On-the-fly URL reading failed for {target_url}: {e}")
+
+            selected_provider = (req.provider or LLM_PROVIDER).lower()
+
             yield sse("status", {"text": "Understanding your question..."})
-            rewritten = rewrite_query(question, req.history)
+            rewritten = rewrite_query(question, req.history, provider=selected_provider)
 
             yield sse("status", {"text": "Searching document database..."})
-            chunks, top_score = retrieve_chunks(rewritten)
+            chunks, top_score = retrieve_chunks(question, rewritten_query=rewritten, url_filter=detected_urls)
 
             if top_score < CONFIDENCE_THRESHOLD and chunks:
                 logger.info(f"Low confidence ({top_score:.2f}), broadening search...")
                 yield sse("status", {"text": "Searching deeper..."})
-                chunks2, score2 = retrieve_chunks(question, top_k=30)
+                chunks2, score2 = retrieve_chunks(question, top_k=35)
                 if score2 > top_score:
                     chunks    = chunks2
                     top_score = score2
@@ -681,18 +759,23 @@ async def ask(req: AskRequest):
                 )
             })
 
-            yield sse("status", {"text": "Generating answer..."})
+            if selected_provider in ("llamacpp", "local"):
+                if not is_local_model_downloaded():
+                    yield sse("status", {"text": "Preparing local Ling-3.0-tiny model (downloading GGUF, ~4.6 GB)..."})
+                else:
+                    yield sse("status", {"text": "Generating answer via Local llama.cpp (Ling 3.0 Tiny)..."})
+            else:
+                yield sse("status", {"text": "Generating answer via Qwen 3.8 27B (Groq)..."})
 
-            stream_resp = llm_call(
-                messages   = messages,
-                max_tokens = 1200,
-                stream     = True,
-            )
-
-            for chunk in stream_resp:
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    yield sse("token", {"text": delta.content})
+            for delta_text in stream_chat_completion(
+                messages=messages,
+                provider=selected_provider,
+                temperature=0.66,
+                max_tokens=4096,
+                top_p=0.95,
+            ):
+                if delta_text:
+                    yield sse("token", {"text": delta_text})
                 await asyncio.sleep(0)
 
             yield sse("sources", {"sources": sources})
@@ -719,28 +802,56 @@ async def ask(req: AskRequest):
 # HEALTH CHECK
 # ══════════════════════════════════════════════════════════════════
 
+@app.get("/models")
+def get_models():
+    return {
+        "current_provider": LLM_PROVIDER,
+        "models": [
+            {
+                "id": "groq",
+                "name": "Qwen 3.8 27B",
+                "badge": "Cloud (Groq)",
+                "description": "Ultra-fast cloud inference (reasoning_effort=none), 4096 tokens",
+                "ready": bool(GROQ_API_KEY),
+            },
+            {
+                "id": "llamacpp",
+                "name": "Ling 3.0 Tiny",
+                "badge": "Local (llama.cpp)",
+                "description": "100% offline GGUF (Q4_K_M) running directly on CPU",
+                "ready": is_local_model_downloaded(),
+            },
+        ]
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# HEALTH CHECK
+# ══════════════════════════════════════════════════════════════════
+
 @app.get("/health")
 def health():
     try:
-        info      = qdrant.get_collection(QDRANT_COLLECTION)
-        qdrant_ok = f"ok — {info.points_count} points"
+        coll = get_chroma_collection()
+        count = coll.count()
+        chroma_ok = f"ok — {count} points"
     except Exception as e:
-        qdrant_ok = f"error: {e}"
+        chroma_ok = f"error: {e}"
 
     return {
         "status":               "ok",
         "llm_provider":         LLM_PROVIDER,
-        "llm_model":            LLM_MODEL,
+        "cloud_model":          GROQ_MODEL,
+        "local_model":          LOCAL_MODEL_FILE,
+        "local_model_ready":    is_local_model_downloaded(),
         "embed_model":          EMBEDDING_MODEL,
-        "embed_provider":       "gemini",
-        "rerank_model":         "none",
-        "qdrant":               qdrant_ok,
-        "collection":           QDRANT_COLLECTION,
+        "embed_provider":       "local (all-MiniLM-L6-v2)",
+        "chromadb":             chroma_ok,
+        "collection":           CHROMA_COLLECTION,
         "hybrid_search":        f"vector({VECTOR_WEIGHT}) + bm25({BM25_WEIGHT})",
         "retrieval_top_k":      RETRIEVAL_TOP_K_EXPANDED,
         "confidence_threshold": CONFIDENCE_THRESHOLD,
     }
-
 
 
 if __name__ == "__main__":

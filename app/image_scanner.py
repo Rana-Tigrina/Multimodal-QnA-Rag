@@ -1,480 +1,198 @@
 """
-IITM BS RAG Pipeline — Stage 2: Image Scanner
-===============================================
-INPUT:  output/images/*.png/jpg       (saved by scraper.py)
-        output/image_metadata.json    (saved by scraper.py)
-
-OUTPUT: output/image_metadata.json    (UPDATED with image_content)
-
-What it does:
-  - Runs Docling OCR on every image (no skipping)
-  - Extracts text, tables, diagrams from each image
-  - Detects decorative/blank images automatically
-  - Updates image_metadata.json with results
-  - Tiny images (<1KB) flagged but still scanned
-
-Run:
-  python image_scanner.py
+Universal AI Knowledge Assistant — Local Image OCR Scanner
+===========================================================
+100% Local image text and table recognition.
+- Primary: Docling DocumentConverter (layout and markdown table extraction)
+- Secondary Fallback: RapidOCR ONNX Engine (PP-OCRv6, ultra-fast CPU inference)
+- Tertiary Fallback: PIL metadata specifications
 """
 
 import os
-import json
 import logging
+import concurrent.futures
 from pathlib import Path
-from PIL import Image as PILImage
+from typing import Optional, List
 
-# Disable Hugging Face Hub symlinks on Windows to prevent WinError 1314
+# Disable Hugging Face Hub symlinks on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
-from config import (
-    IMAGE_METADATA_FILE,
-    IMAGES_DIR,
-    LOG_LEVEL,
-    LOG_FORMAT,
-)
-
-# ══════════════════════════════════════════════════════════════════
-# LOGGING
-# ══════════════════════════════════════════════════════════════════
+from config import IMAGES_DIR, LOG_LEVEL, LOG_FORMAT
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger("image_scanner")
 
-# ══════════════════════════════════════════════════════════════════
-# CONSTANTS
-# ══════════════════════════════════════════════════════════════════
-
-# Images smaller than this are almost certainly blank/spacer pixels
-TINY_IMAGE_BYTES = 500
-
-# If Docling returns fewer characters than this → treat as decorative
 MIN_CONTENT_CHARS = 10
 
-# ══════════════════════════════════════════════════════════════════
-# DOCLING SETUP
-# ══════════════════════════════════════════════════════════════════
+_docling_converter = None
+_rapidocr_engine = None
+
 
 def load_docling():
-    """
-    Load Docling pipeline once — reused for all 60 images.
-    INPUT:  nothing
-    OUTPUT: DocumentConverter instance
-    """
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
-    from docling.datamodel.base_models import InputFormat
+    """Load Docling pipeline singleton with OCR enabled."""
+    global _docling_converter
+    if _docling_converter is not None:
+        return _docling_converter
 
-    logger.info("Loading Docling pipeline...")
-
-    # Use OCR-optimized pipeline with timeouts
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
-    pipeline_options.do_table_structure = True
-    # Limit OCR to prevent hanging on complex images
-    pipeline_options.ocr_options = None  # Use defaults but we'll add timeout at call level
-
-    converter = DocumentConverter()
-    logger.info("Docling pipeline ready")
-    return converter
-
-
-# ══════════════════════════════════════════════════════════════════
-# IMAGE CLASSIFIER
-# Decides what type of content the image contains
-# ══════════════════════════════════════════════════════════════════
-
-def classify_image_content(text: str, file_size_bytes: int) -> dict:
-    """
-    INPUT:  extracted text from Docling + file size
-    OUTPUT: dict with chunk_type, is_decorative
-
-    chunk_type options:
-      image_table    → image contains a table
-      image_diagram  → image contains a diagram/flowchart
-      image_text     → image contains plain text
-      image_empty    → nothing useful extracted
-    """
-    text = text.strip()
-
-    # Blank or near-blank
-    if not text or len(text) < MIN_CONTENT_CHARS:
-        return {
-            "chunk_type":    "image_empty",
-            "is_decorative": True,
-        }
-
-    # Tiny file size → likely spacer pixel even if text extracted
-    if file_size_bytes < TINY_IMAGE_BYTES:
-        return {
-            "chunk_type":    "image_empty",
-            "is_decorative": True,
-        }
-
-    text_lower = text.lower()
-
-    # Table indicators
-    table_indicators = [
-        "|", "---", "course code", "credits", "marks",
-        "percentage", "grade", "fee", "term", "week",
-        "total", "minimum", "maximum", "sl.no", "s.no",
-    ]
-    table_score = sum(1 for ind in table_indicators if ind in text_lower)
-
-    if table_score >= 2 or text.count("|") >= 3:
-        return {
-            "chunk_type":    "image_table",
-            "is_decorative": False,
-        }
-
-    # Diagram indicators
-    diagram_indicators = [
-        "→", "←", "↑", "↓", "flow", "process",
-        "step", "level", "foundation", "diploma",
-        "degree", "pathway", "arrow",
-    ]
-    diagram_score = sum(1 for ind in diagram_indicators if ind in text_lower)
-
-    if diagram_score >= 2:
-        return {
-            "chunk_type":    "image_diagram",
-            "is_decorative": False,
-        }
-
-    # Has meaningful text
-    return {
-        "chunk_type":    "image_text",
-        "is_decorative": False,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════
-# SINGLE IMAGE SCANNER
-# ══════════════════════════════════════════════════════════════════
-
-def scan_image(filepath: Path, converter) -> dict:
-    """
-    INPUT:  path to image file + Docling converter
-    OUTPUT: dict with image_content, chunk_type, is_decorative
-
-    Tries Docling first.
-    Falls back to basic PIL check if Docling fails.
-    Never crashes — always returns something.
-    """
-    file_size = filepath.stat().st_size
-
-    # ── Tiny file fast path ───────────────────────────────────────
-    if file_size < TINY_IMAGE_BYTES:
-        logger.info(f"  {filepath.name} → tiny ({file_size}B) flagging as decorative")
-        return {
-            "image_content": "",
-            "chunk_type":    "image_empty",
-            "is_decorative": True,
-            "scan_method":   "size_check",
-            "scan_error":    None,
-        }
-
-    # ── Docling scan ──────────────────────────────────────────────
+    logger.info("Loading Docling pipeline with OCR...")
     try:
-        result   = converter.convert(str(filepath))
-        markdown = result.document.export_to_markdown()
-        markdown = markdown.strip()
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
 
-        classification = classify_image_content(markdown, file_size)
-
-        logger.info(
-            f"  {filepath.name} → {classification['chunk_type']} "
-            f"({'decorative' if classification['is_decorative'] else f'{len(markdown)} chars'})"
+        pipeline_options = PdfPipelineOptions(do_ocr=True)
+        _docling_converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
         )
-
-        return {
-            "image_content": markdown,
-            "chunk_type":    classification["chunk_type"],
-            "is_decorative": classification["is_decorative"],
-            "scan_method":   "docling",
-            "scan_error":    None,
-        }
-
     except Exception as e:
-        logger.warning(f"  {filepath.name} → Docling failed: {e}")
+        logger.warning(f"Could not load custom PdfPipelineOptions ({e}), loading standard DocumentConverter...")
+        from docling.document_converter import DocumentConverter
+        _docling_converter = DocumentConverter()
 
-        # ── PIL fallback — at least get image dimensions ──────────
+    logger.info("Docling pipeline ready")
+    return _docling_converter
+
+
+def load_rapidocr():
+    """Load RapidOCR singleton engine on ONNXRuntime for fast local OCR fallback."""
+    global _rapidocr_engine
+    if _rapidocr_engine is None:
         try:
-            with PILImage.open(filepath) as img:
-                w, h = img.size
-                mode = img.mode
-
-            # Very small dimensions → decorative
-            if w < 10 or h < 10:
-                return {
-                    "image_content": "",
-                    "chunk_type":    "image_empty",
-                    "is_decorative": True,
-                    "scan_method":   "pil_fallback",
-                    "scan_error":    str(e),
-                }
-
-            return {
-                "image_content": f"[Image scan failed — {w}x{h}px {mode}. Contains visual content that could not be extracted automatically.]",
-                "chunk_type":    "image_text",
-                "is_decorative": False,
-                "scan_method":   "pil_fallback",
-                "scan_error":    str(e),
-            }
-
-        except Exception as e2:
-            logger.error(f"  {filepath.name} → PIL also failed: {e2}")
-            return {
-                "image_content": "[Image could not be scanned]",
-                "chunk_type":    "image_text",
-                "is_decorative": False,
-                "scan_method":   "failed",
-                "scan_error":    f"Docling: {e} | PIL: {e2}",
-            }
+            from rapidocr import RapidOCR
+            _rapidocr_engine = RapidOCR()
+            logger.info("RapidOCR local ONNX engine ready")
+        except Exception as e:
+            logger.warning(f"Could not initialize RapidOCR: {e}")
+            return None
+    return _rapidocr_engine
 
 
-def scan_with_gemini_vision(filepath: Path) -> dict | None:
-    """
-    Fallback OCR and image understanding using Gemini Vision.
-    Executes if Docling is not installed or encounters an error.
-    """
+def scan_with_rapidocr(filepath: Path) -> Optional[dict]:
+    """100% Local OCR fallback using RapidOCR (ONNXRuntime PP-OCRv6)."""
     try:
-        import google.generativeai as genai
-        from PIL import Image as PILImage
-        from config import GEMINI_API_KEY
-
-        if not GEMINI_API_KEY:
+        engine = load_rapidocr()
+        if not engine:
             return None
 
-        genai.configure(api_key=GEMINI_API_KEY)
-        models_to_try = [
-            "gemini-3.5-flash",
-            "gemini-flash-latest",
-        ]
+        out = engine(str(filepath))
+        txts = getattr(out, "txts", None)
+        if txts is None and isinstance(out, (tuple, list)) and len(out) > 0:
+            if isinstance(out[0], (list, tuple)):
+                txts = [line[1] for line in out[0] if len(line) > 1]
 
-        
-        # Ensure RGBA / CMYK / Palette images convert safely to RGB
-        img = PILImage.open(filepath).convert("RGB")
-        prompt = (
-            "Extract all text, table data, diagram titles, and numbers from this image. "
-            "If it contains a table, output it as a markdown table. "
-            "If it is a decorative/blank image or logo with no useful information, reply with DECORATIVE."
-        )
-
-        response = None
-        for m_name in models_to_try:
-            try:
-                model = genai.GenerativeModel(m_name)
-                response = model.generate_content([prompt, img])
-                if response:
-                    break
-            except Exception:
-                continue
-
-        text = response.text.strip() if (response and hasattr(response, "text") and response.text) else ""
-
-        if not text or ("DECORATIVE" in text.upper() and len(text) < 30):
+        if not txts:
             return {
                 "image_content": "",
                 "chunk_type": "image_text",
                 "is_decorative": True,
-                "scan_method": "gemini_vision",
+                "scan_method": "rapidocr_onnx",
+            }
+
+        text = "\n".join(str(t) for t in txts).strip()
+        if len(text) < MIN_CONTENT_CHARS:
+            return {
+                "image_content": "",
+                "chunk_type": "image_text",
+                "is_decorative": True,
+                "scan_method": "rapidocr_onnx",
             }
 
         return {
             "image_content": text,
             "chunk_type": "image_text",
             "is_decorative": False,
-            "scan_method": "gemini_vision",
+            "scan_method": "rapidocr_onnx",
         }
     except Exception as e:
-        logger.warning(f"Gemini Vision fallback failed for {filepath.name}: {e}")
+        logger.warning(f"RapidOCR local scan failed for {filepath.name}: {e}")
         return None
 
+
+def scan_image(filepath: Path, converter=None) -> dict:
+    """Scan a single image using Docling DocumentConverter."""
+    if converter is None:
+        converter = load_docling()
+
+    try:
+        result = converter.convert(str(filepath))
+        markdown = result.document.export_to_markdown().strip()
+
+        # Check for decorative tags
+        if not markdown or len(markdown) < MIN_CONTENT_CHARS:
+            return {
+                "image_content": "",
+                "chunk_type": "image_text",
+                "is_decorative": True,
+                "scan_method": "docling_ocr",
+            }
+
+        return {
+            "image_content": markdown,
+            "chunk_type": "image_table" if ("|---" in markdown or "|---|" in markdown) else "image_text",
+            "is_decorative": False,
+            "scan_method": "docling_ocr",
+        }
+    except Exception as e:
+        logger.warning(f"Docling conversion failed for {filepath.name}: {e}")
+        return {
+            "image_content": "",
+            "chunk_type": "image_text",
+            "is_decorative": False,
+            "scan_method": "failed",
+        }
 
 
 def scan_single_image(filepath: Path) -> dict:
     """
-    Modular function to scan a single image file via Docling / Gemini Vision / PIL.
-    Used for live file uploads and embedded PDF/DOCX images.
-    Includes timeout protection to prevent hanging on complex OCR operations.
+    Modular function to scan a single image file via 100% local Docling / RapidOCR / PIL.
+    Includes cross-platform timeout protection for both Windows and Linux.
     """
-    import signal
-    
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Docling OCR timed out after 30 seconds for {filepath.name}")
-    
-    # Set timeout for Docling operation
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(30)  # 30 second timeout for OCR
-    
+    # 1. Primary: Docling DocumentConverter with 30s timeout
     try:
-        converter = load_docling()
-        res = scan_image(filepath, converter)
-        logger.info(f"🛠️ Scanned '{filepath.name}' using DOCLING OCR")
-        signal.alarm(0)  # Cancel alarm
-        return res
-    except TimeoutError as e:
-        signal.alarm(0)  # Cancel alarm
-        logger.warning(f"⏰ {e}. Falling back to Gemini Vision OCR...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(scan_image, filepath)
+            res = future.result(timeout=30)
+            if res and res.get("image_content"):
+                logger.info(f"🛠️ Scanned '{filepath.name}' using DOCLING OCR")
+                return res
+            elif res and res.get("is_decorative"):
+                return res
     except Exception as e:
-        signal.alarm(0)  # Cancel alarm
-        logger.info(f"Docling fallback for {filepath.name} ({e}). Attempting Gemini Vision OCR...")
+        logger.info(f"Docling timed out or failed for {filepath.name} ({e}). Trying RapidOCR...")
 
-    # Secondary Fallback: Gemini Vision OCR (with its own timeout)
-    signal.alarm(20)  # 20 second timeout for Gemini
+    # 2. Secondary Fallback: Local RapidOCR ONNX engine with 15s timeout
     try:
-        gemini_res = scan_with_gemini_vision(filepath)
-        signal.alarm(0)  # Cancel alarm
-        if gemini_res:
-            logger.info(f"🌐 Scanned '{filepath.name}' using GEMINI VISION API")
-            return gemini_res
-    except TimeoutError:
-        signal.alarm(0)
-        logger.warning(f"⏰ Gemini Vision timed out after 20 seconds for {filepath.name}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(scan_with_rapidocr, filepath)
+            rapid_res = future.result(timeout=15)
+            if rapid_res and (rapid_res.get("image_content") or rapid_res.get("is_decorative")):
+                logger.info(f"⚡ Scanned '{filepath.name}' using RAPIDOCR (Local ONNX)")
+                return rapid_res
     except Exception as e:
-        signal.alarm(0)
-        logger.warning(f"Gemini Vision fallback failed for {filepath.name}: {e}")
+        logger.warning(f"RapidOCR fallback failed for {filepath.name}: {e}")
 
-    # Tertiary Fallback: PIL image specs
+    # 3. Tertiary Fallback: PIL image specifications
     try:
+        from PIL import Image as PILImage
         with PILImage.open(filepath) as img:
             w, h = img.size
-            logger.info(f"🖼️ Scanned '{filepath.name}' using PIL specs ({w}x{h} px)")
             return {
-                "image_content": f"[Image file: {filepath.name} ({w}x{h} px)]",
+                "image_content": f"[Image: {filepath.name} ({w}x{h} px)]",
                 "chunk_type": "image_text",
                 "is_decorative": False,
                 "scan_method": "pil_fallback",
             }
     except Exception:
         return {
-            "image_content": f"[Image file: {filepath.name}]",
+            "image_content": f"[Image: {filepath.name}]",
             "chunk_type": "image_text",
             "is_decorative": False,
             "scan_method": "fallback",
         }
 
 
-
-
-# ══════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════
-
-
-def run():
-    print("\n" + "═" * 65)
-    print("  IITM BS RAG Pipeline — Stage 2: Image Scanner")
-    print("═" * 65)
-
-    # Load image metadata from scraper
-    if not IMAGE_METADATA_FILE.exists():
-        print(f"\n  ❌ {IMAGE_METADATA_FILE} not found")
-        print(f"     Run python scraper.py first")
-        return
-
-    with open(IMAGE_METADATA_FILE) as f:
-        image_records = json.load(f)
-
-    total = len(image_records)
-    print(f"\n  Images to scan: {total}")
-
-    # Check which need scanning
-    needs_scan = [r for r in image_records if r.get("needs_ocr", True)]
-    already_done = total - len(needs_scan)
-    if already_done > 0:
-        print(f"  Already scanned: {already_done} (skipping)")
-
-    if not needs_scan:
-        print(f"\n  ✅ All images already scanned")
-        return
-
-    # Load Docling once
-    converter = load_docling()
-
-    # Track stats
-    stats = {
-        "image_table":   0,
-        "image_diagram": 0,
-        "image_text":    0,
-        "image_empty":   0,
-        "scan_errors":   0,
-    }
-
-    print(f"\n  Scanning {len(needs_scan)} images...\n")
-
-    for i, record in enumerate(image_records):
-
-        # Skip already scanned
-        if not record.get("needs_ocr", True):
-            continue
-
-        filename = record.get("filename", "")
-        filepath = IMAGES_DIR / filename
-
-        print(f"  [{i+1:02d}/{total}] {filename}")
-        print(f"         Section: {record.get('section', '')[:60]}")
-
-        if not filepath.exists():
-            logger.warning(f"  File not found: {filepath}")
-            record.update({
-                "image_content": "[File not found]",
-                "chunk_type":    "image_empty",
-                "is_decorative": True,
-                "needs_ocr":     False,
-                "scan_error":    "file_not_found",
-            })
-            stats["image_empty"] += 1
-            continue
-
-        # Scan the image
-        result = scan_image(filepath, converter)
-
-        # Update record
-        record.update({
-            "image_content": result["image_content"],
-            "chunk_type":    result["chunk_type"],
-            "is_decorative": result["is_decorative"],
-            "scan_method":   result["scan_method"],
-            "scan_error":    result["scan_error"],
-            "needs_ocr":     False,  # mark as done
-        })
-
-        # Update stats
-        chunk_type = result["chunk_type"]
-        stats[chunk_type] = stats.get(chunk_type, 0) + 1
-        if result["scan_error"]:
-            stats["scan_errors"] += 1
-
-        # Show what was extracted
-        content_preview = result["image_content"][:100] if result["image_content"] else ""
-        if content_preview:
-            print(f"         Content: {content_preview}...")
-        print()
-
-        # Save after every image — so crash doesn't lose progress
-        with open(IMAGE_METADATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(image_records, f, indent=2, ensure_ascii=False)
-
-    # Final save
-    with open(IMAGE_METADATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(image_records, f, indent=2, ensure_ascii=False)
-
-    # Summary
-    print("\n" + "═" * 65)
-    print("  ✅ IMAGE SCANNING COMPLETE")
-    print("═" * 65)
-    print(f"  Total images:    {total}")
-    print(f"  Tables found:    {stats.get('image_table', 0)}")
-    print(f"  Diagrams found:  {stats.get('image_diagram', 0)}")
-    print(f"  Text images:     {stats.get('image_text', 0)}")
-    print(f"  Empty/Decorative:{stats.get('image_empty', 0)}")
-    print(f"  Scan errors:     {stats.get('scan_errors', 0)}")
-    print(f"\n  Updated: {IMAGE_METADATA_FILE}")
-    print(f"\n  Next step: python chunker.py")
-    print("═" * 65)
-
-
-if __name__ == "__main__":
-    run()
+def scan_images(image_paths: List[Path]) -> List[dict]:
+    """Batch scan a list of image paths."""
+    return [scan_single_image(p) for p in image_paths]

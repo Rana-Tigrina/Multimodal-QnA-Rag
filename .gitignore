@@ -42,6 +42,12 @@ Thumbs.db
 .env.local
 *.env.*
 
+# Vector DB
+chroma_db/
+app/chroma_db/
+qdrant_db/
+app/qdrant_db/
+
 # Coverage
 .coverage
 htmlcov/
@@ -97,8 +103,23 @@ MANIFEST
 *.Z
 *.lz
 *.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
+# Runtime Uploads & Processed Artifacts
+uploads/
+app/uploads/
+output/
+app/output/
+
+# Local Model Weights
+local_models/
+app/local_models/
+*.gguf
+*.bin
+
+# Node & Next.js
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+*.tsbuildinfo
+frontend/*.tsbuildinfo
 

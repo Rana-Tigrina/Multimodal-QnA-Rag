@@ -1,114 +1,98 @@
 """
-Universal AI Knowledge RAG Pipeline — Central Configuration
+Universal AI Knowledge Assistant — Configuration
+=================================================
+Centralized settings following 12-Factor principles.
+Supports:
+  - LLM Cloud: Groq (qwen/qwen3.8-27b, reasoning_effort=none)
+  - LLM Local: llama.cpp (bartowski/Ling-3.0-tiny-GGUF:Q4_K_M)
+  - Embeddings: 100% Local ONNX all-MiniLM-L6-v2 (384d)
+  - Vector DB: ChromaDB (Local persistent)
+  - Image OCR: Docling + RapidOCR ONNX (100% Local)
 """
+
 import os
 from pathlib import Path
-
-# Disable Hugging Face Hub symlinks on Windows to prevent WinError 1314
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
-
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
+# ══════════════════════════════════════════════════════════════════
+# PATHS & DIRECTORIES
+# ══════════════════════════════════════════════════════════════════
 
-USE_LOCAL_LLM = False
+BASE_DIR            = Path(__file__).parent
+ROOT_DIR            = BASE_DIR.parent
 
-if USE_LOCAL_LLM:
-    LLM_BASE_URL    = "http://localhost:11434/v1"
-    LLM_API_KEY     = "ollama"
-    LLM_MODEL       = "llama3.1"
-    LLM_PROVIDER    = "ollama"
-else:
-    LLM_BASE_URL    = "https://api.groq.com/openai/v1"
-    LLM_API_KEY     = os.getenv("GROQ_API_KEY", "")
-    LLM_MODEL       = "openai/gpt-oss-120b"
-    LLM_PROVIDER    = "groq"
+# Load environment variables (.env in app/ or root)
+load_dotenv(dotenv_path=BASE_DIR / ".env")
+load_dotenv(dotenv_path=ROOT_DIR / ".env")
+
+UPLOAD_DIR          = BASE_DIR / "uploads"
+OUTPUT_DIR          = BASE_DIR / "output"
+IMAGES_DIR          = OUTPUT_DIR / "images"
+CHROMA_PERSIST_DIR  = BASE_DIR / "chroma_db"
+LOCAL_MODELS_DIR    = BASE_DIR / "local_models"
+
+# Ensure runtime directories exist
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS  = {".pdf", ".txt", ".md", ".docx", ".png", ".jpg", ".jpeg"}
+
+# ══════════════════════════════════════════════════════════════════
+# LLM CONFIGURATION
+# ══════════════════════════════════════════════════════════════════
+
+LLM_PROVIDER        = os.getenv("LLM_PROVIDER", "groq").strip().lower()  # "groq" or "llamacpp"
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL          = "qwen/qwen3.8-27b"
+
+LOCAL_MODEL_REPO    = "bartowski/Ling-3.0-tiny-GGUF"
+LOCAL_MODEL_FILE    = "Ling-3.0-tiny-Q4_K_M.gguf"
+LOCAL_MODEL_PATH    = LOCAL_MODELS_DIR / LOCAL_MODEL_FILE
+
+LLM_BASE_URL        = "https://api.groq.com/openai/v1"
+LLM_API_KEY         = GROQ_API_KEY
+LLM_MODEL           = GROQ_MODEL if LLM_PROVIDER == "groq" else f"{LOCAL_MODEL_REPO}:{LOCAL_MODEL_FILE}"
 
 LLM_FALLBACK_MODELS = [
     "llama-3.1-8b-instant",
     "llama3-8b-8192",
     "gemma2-9b-it",
-] if not USE_LOCAL_LLM else []
+]
 
 # ══════════════════════════════════════════════════════════════════
-# EMBEDDING CONFIGURATION — Gemini (free, no card needed)
+# EMBEDDING CONFIGURATION — 100% Local (all-MiniLM-L6-v2)
 # ══════════════════════════════════════════════════════════════════
 
-GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
-EMBEDDING_MODEL     = "models/gemini-embedding-001"
-EMBEDDING_DIM       = 3072
-EMBEDDING_BATCH     = 1
+EMBEDDING_PROVIDER  = "local"
+EMBEDDING_MODEL     = "all-MiniLM-L6-v2"
+EMBEDDING_DIM       = 384
+EMBEDDING_BATCH     = 32
 RERANKER_MODEL      = None
 RERANKER_TOP_K      = 5
 
 # ══════════════════════════════════════════════════════════════════
-# VECTOR DB CONFIGURATION
+# VECTOR DB & HYBRID RETRIEVAL (ChromaDB + BM25)
 # ══════════════════════════════════════════════════════════════════
 
-QDRANT_HOST         = "localhost"
-QDRANT_PORT         = 6333
-QDRANT_COLLECTION   = "knowledge_base"
-
-q_url = os.getenv("QDRANT_URL", "").strip()
-QDRANT_URL = q_url if q_url else f"http://{QDRANT_HOST}:{QDRANT_PORT}"
-
-q_key = os.getenv("QDRANT_API_KEY", "").strip()
-QDRANT_API_KEY = q_key if q_key else None
-
-
-
+CHROMA_COLLECTION   = os.getenv("CHROMA_COLLECTION", "knowledge_base").strip() or "knowledge_base"
 VECTOR_WEIGHT       = 0.7
 BM25_WEIGHT         = 0.3
-
-RETRIEVAL_TOP_K     = 20
-RERANK_TOP_K        = 4
-
-# ══════════════════════════════════════════════════════════════════
-# SCRAPER CONFIGURATION
-# ══════════════════════════════════════════════════════════════════
-
-ROOT_DOCS = []
-
-FOLLOW_URL_PATTERN  = r".*"
-
-
-SKIP_DOMAINS = [
-    "drive.google.com",
-    "support.google.com",
-    "accounts.google.com",
-]
-
+RETRIEVAL_TOP_K     = 25
+RERANK_TOP_K        = 6
+CONFIDENCE_THRESHOLD = 0.15
 REQUEST_TIMEOUT     = 15
-DELAY_BETWEEN       = 1.0
 
 # ══════════════════════════════════════════════════════════════════
-# CHUNKER CONFIGURATION
+# CHUNKER & HYDE CONFIGURATION
 # ══════════════════════════════════════════════════════════════════
 
 CHUNK_SIZE          = 512
 CHUNK_OVERLAP       = 50
-MIN_CHUNK_SIZE      = 50
-
-CHUNK_TYPES = [
-    "text",
-    "table",
-    "image",
-    "reference_link",
-    "restricted_doc",
-    "section_index",
-]
-
-# ══════════════════════════════════════════════════════════════════
-# HYDE CONFIGURATION
-# ══════════════════════════════════════════════════════════════════
+MIN_CHUNK_SIZE      = 15
 
 HYDE_QUESTIONS_PER_CHUNK = 3
-HYDE_SKIP_TYPES = [
-    "section_index",
-    "restricted_doc",
-]
-
 HYDE_PROMPT = """You are building a RAG system for document knowledge retrieval.
 
 Given this content from a document:
@@ -129,57 +113,7 @@ Rules:
 - Return ONLY the questions, one per line, no numbering"""
 
 # ══════════════════════════════════════════════════════════════════
-# IMAGE SCANNER CONFIGURATION
-# ══════════════════════════════════════════════════════════════════
-
-IMAGE_SCAN_ALL      = True
-IMAGE_MIN_SIZE_KB   = 1
-
-IMAGE_PROMPT = """This image is from a document.
-Section: {section}
-Context before image: {before}
-Context after image: {after}
-
-Analyze this image and:
-1. If it contains a TABLE: extract ALL data from the table in markdown format
-2. If it contains a DIAGRAM or FLOWCHART: describe the structure and all labels clearly
-3. If it contains TEXT: extract the text exactly
-4. If it is DECORATIVE (logo, banner, illustration with no data): respond with exactly: DECORATIVE
-
-Be thorough and extract every piece of information visible."""
-
-# ══════════════════════════════════════════════════════════════════
-# PATHS & UPLOADS
-# ══════════════════════════════════════════════════════════════════
-
-BASE_DIR            = Path(__file__).parent
-OUTPUT_DIR          = BASE_DIR / "output"
-UPLOAD_DIR          = BASE_DIR / "uploads"
-DOCS_DIR            = OUTPUT_DIR / "docs"
-LINKED_DIR          = DOCS_DIR / "linked_docs"
-IMAGES_DIR          = OUTPUT_DIR / "images"
-CHUNKS_DIR          = OUTPUT_DIR / "chunks"
-
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-DOCS_DIR.mkdir(parents=True, exist_ok=True)
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
-
-ALLOWED_EXTENSIONS  = {".pdf", ".txt", ".md", ".docx", ".png", ".jpg", ".jpeg"}
-
-CHECKPOINT_FILE     = OUTPUT_DIR / "checkpoint.json"
-SKIPPED_LOG         = OUTPUT_DIR / "skipped_links.log"
-IMAGE_METADATA_FILE = OUTPUT_DIR / "image_metadata.json"
-REFERENCE_LINKS_FILE= OUTPUT_DIR / "reference_links.json"
-RESTRICTED_LINKS_FILE= OUTPUT_DIR / "restricted_links.json"
-DOC_REGISTRY_FILE   = OUTPUT_DIR / "document_registry.json"
-ALL_CHUNKS_FILE     = CHUNKS_DIR / "all_chunks.json"
-EVAL_SET_FILE       = BASE_DIR / "eval_set.json"
-EVAL_REPORT_FILE    = BASE_DIR / "eval_report.json"
-
-# ══════════════════════════════════════════════════════════════════
-# RAG CONFIGURATION
+# SYSTEM PROMPT & LOGGING
 # ══════════════════════════════════════════════════════════════════
 
 RAG_SYSTEM_PROMPT = """You are an expert AI Document Knowledge Assistant.
@@ -197,42 +131,15 @@ Rules:
 6. Never make up information
 7. If answer is in an external link — provide that link directly"""
 
-STREAM_RESPONSE     = True
-SCRAPE_INTERVAL_WEEKS = 13
-
-# ══════════════════════════════════════════════════════════════════
-# FILE UPLOAD & MULTI-MODAL CONFIGURATION
-# ══════════════════════════════════════════════════════════════════
-
-BASE_DIR = Path(__file__).parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-IMAGES_DIR = BASE_DIR / "output" / "images"
-
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-
-ALLOWED_EXTENSIONS = {
-    ".pdf", ".docx", ".doc", ".txt", ".md", ".png", ".jpg", ".jpeg"
-}
-
 LOG_LEVEL           = "INFO"
 LOG_FORMAT          = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
-
-
-# ══════════════════════════════════════════════════════════════════
-# VALIDATION
-# ══════════════════════════════════════════════════════════════════
-
 def validate():
+    """Verify environment configuration and report status."""
     errors = []
-
-    if not USE_LOCAL_LLM and not LLM_API_KEY:
+    if LLM_PROVIDER == "groq" and not GROQ_API_KEY:
         errors.append("GROQ_API_KEY environment variable not set")
-
-    if not GEMINI_API_KEY:
-        errors.append("GEMINI_API_KEY environment variable not set")
 
     if errors:
         print("\n❌ Configuration errors:")
@@ -240,11 +147,11 @@ def validate():
             print(f"   → {e}")
         raise SystemExit(1)
 
-    print(f"\n✅ Config loaded:")
+    print("\n✅ Config loaded:")
     print(f"   LLM:        {LLM_PROVIDER} → {LLM_MODEL}")
-    print(f"   Embeddings: {EMBEDDING_MODEL} (Gemini)")
-    print(f"   Vector DB:  {QDRANT_URL}/{QDRANT_COLLECTION}")
-    print(f"   Mode:       {'🔒 Private (local)' if USE_LOCAL_LLM else '🌐 Public (API)'}")
+    print(f"   Embeddings: {EMBEDDING_MODEL} (Local ONNX, 384d)")
+    print(f"   Vector DB:  ChromaDB (local: {CHROMA_PERSIST_DIR.name}) → Collection: '{CHROMA_COLLECTION}'")
+    print(f"   Mode:       {'💻 Local llama.cpp (Ling 3.0 Tiny)' if LLM_PROVIDER == 'llamacpp' else '⚡ Groq Cloud (Qwen 3.8 27B)'}")
 
 
 if __name__ == "__main__":

@@ -28,38 +28,76 @@ def sse_event(step: str, detail: str, progress: int = 0) -> str:
     return f"data: {json.dumps({'type': 'progress', 'step': step, 'detail': detail, 'progress': progress})}\n\n"
 
 
-def parse_pdf_file(filepath: Path) -> tuple[str, list[Path]]:
+def parse_pdf_file(filepath: Path | str) -> tuple[str, list[Path]]:
     """
-    Extract text and embedded images from a PDF file.
+    Extract text, tables, and images from a PDF file using Docling OCR as primary parser,
+    with pypdf + image OCR fallback for maximum resilience.
+    Handles digital PDFs, scanned PDFs (image-only), and mixed documents.
     """
-    import pypdf
-
-    reader = pypdf.PdfReader(filepath)
+    filepath = Path(filepath)
     text_parts = []
     extracted_images = []
 
-    for i, page in enumerate(reader.pages):
-        try:
-            page_text = page.extract_text()
-            if page_text:
-                text_parts.append(f"## Page {i + 1}\n{page_text}")
-        except Exception as e:
-            logger.warning(f"Error extracting text from page {i + 1}: {e}")
+    # 1. Primary: Docling DocumentConverter (handles layout, tables & OCR on scanned pages)
+    try:
+        from image_scanner import load_docling
+        logger.info(f"Parsing PDF '{filepath.name}' with Docling OCR pipeline...")
+        converter = load_docling()
+        doc_result = converter.convert(str(filepath))
+        markdown_text = doc_result.document.export_to_markdown().strip()
+        if len(markdown_text) > 30:
+            logger.info(f"Docling successfully parsed '{filepath.name}' ({len(markdown_text)} chars)")
+            return markdown_text, []
+        elif markdown_text:
+            logger.info(f"Docling returned brief text ({len(markdown_text)} chars). Appending and checking fallback.")
+            text_parts.append(markdown_text)
+    except Exception as e:
+        logger.warning(f"Docling PDF parsing encountered issue ({e}), running fallback extraction...")
 
-        # Extract embedded image objects safely
-        try:
-            for img_idx, img_obj in enumerate(page.images):
-                try:
-                    name = getattr(img_obj, "name", f"img_{img_idx}.png")
-                    img_name = f"{filepath.stem}_p{i + 1}_{name}"
-                    img_path = IMAGES_DIR / img_name
-                    with open(img_path, "wb") as f:
-                        f.write(img_obj.data)
-                    extracted_images.append(img_path)
-                except Exception as e:
-                    logger.warning(f"Could not extract image {img_idx} from page {i + 1}: {e}")
-        except Exception:
-            pass
+    # 2. Fallback: pypdf extraction + embedded image extraction
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(str(filepath))
+        for i, page in enumerate(reader.pages):
+            try:
+                page_text = page.extract_text()
+                if page_text and page_text.strip():
+                    text_parts.append(f"## Page {i + 1}\n{page_text.strip()}")
+            except Exception as e:
+                logger.warning(f"Error extracting text from page {i + 1}: {e}")
+
+            # Extract embedded image objects safely
+            try:
+                for img_idx, img_obj in enumerate(page.images):
+                    try:
+                        name = getattr(img_obj, "name", f"img_{img_idx}.png")
+                        img_name = f"{filepath.stem}_p{i + 1}_{name}"
+                        img_path = IMAGES_DIR / img_name
+                        with open(img_path, "wb") as f:
+                            f.write(img_obj.data)
+                        extracted_images.append(img_path)
+                    except Exception as e:
+                        logger.warning(f"Could not extract image {img_idx} from page {i + 1}: {e}")
+            except Exception:
+                pass
+
+        # 3. If text is still empty (e.g. purely scanned image PDF), transcribe extracted images via scanner
+        total_text_len = sum(len(t) for t in text_parts)
+        if total_text_len < 30 and extracted_images:
+            logger.info(f"Scanned/Image-only PDF detected for '{filepath.name}'. Running OCR scanner on {len(extracted_images)} page images...")
+            try:
+                from image_scanner import scan_images
+                scanned_results = scan_images(extracted_images)
+                for s_res in scanned_results:
+                    c = s_res.get("content", "").strip()
+                    if c:
+                        sec_name = s_res.get("section", f"Scanned Image {s_res.get('image_file', '')}")
+                        text_parts.append(f"## {sec_name}\n{c}")
+            except Exception as e:
+                logger.warning(f"Image scanner failed on extracted PDF images: {e}")
+
+    except Exception as e2:
+        logger.error(f"Fallback pypdf parser also failed for '{filepath.name}': {e2}")
 
     return "\n\n".join(text_parts), extracted_images
 
@@ -173,10 +211,10 @@ def ingest_file_stream(filepath: Path, original_filename: str) -> Generator[str,
         yield sse_event("hyde", f"Generating HyDE questions for {len(chunks)} chunk(s)...", 60)
         chunks = generate_hyde_for_chunks(chunks)
 
-        yield sse_event("embedding", f"Vectorizing {len(chunks)} chunk(s) via Gemini...", 80)
+        yield sse_event("embedding", f"Vectorizing {len(chunks)} chunk(s) via all-MiniLM-L6-v2...", 80)
         chunks = embed_chunk_list(chunks)
 
-        yield sse_event("indexing", "Upserting points to Qdrant...", 95)
+        yield sse_event("indexing", "Indexing points into ChromaDB...", 95)
         point_count = upload_chunks_batch(chunks)
 
         yield sse_event("done", f"Successfully indexed {point_count} chunk(s) for '{doc_title}'", 100)
@@ -207,10 +245,10 @@ def ingest_url_stream(url: str) -> Generator[str, None, None]:
         yield sse_event("hyde", f"Generating HyDE questions for {len(chunks)} chunk(s)...", 60)
         chunks = generate_hyde_for_chunks(chunks)
 
-        yield sse_event("embedding", f"Vectorizing {len(chunks)} chunk(s) via Gemini...", 80)
+        yield sse_event("embedding", f"Vectorizing {len(chunks)} chunk(s) via all-MiniLM-L6-v2...", 80)
         chunks = embed_chunk_list(chunks)
 
-        yield sse_event("indexing", "Upserting points to Qdrant...", 95)
+        yield sse_event("indexing", "Indexing points into ChromaDB...", 95)
         point_count = upload_chunks_batch(chunks)
 
         yield sse_event("done", f"Successfully indexed {point_count} chunk(s) from '{doc_title}'", 100)

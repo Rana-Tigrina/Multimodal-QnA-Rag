@@ -3,7 +3,7 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Message } from "@/types";
+import { Message, Source } from "@/types";
 
 interface MessageBubbleProps {
   message: Message;
@@ -12,11 +12,126 @@ interface MessageBubbleProps {
   isLoading: boolean;
 }
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 function MarkdownContent({ content, dark }: { content: string; dark: boolean }) {
-  const clean = content.replace(/\n*📎[\s\S]*$/m, "").trim();
   return (
     <div className={`prose prose-sm max-w-none [&_a]:text-blue-500 [&_a]:no-underline hover:[&_a]:underline ${dark ? "prose-invert" : ""}`}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{clean}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    </div>
+  );
+}
+
+function CitationCard({ source, dark }: { source: Source; dark: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const isWebUrl = source.url && (source.url.startsWith("http://") || source.url.startsWith("https://"));
+  const isFile = source.url && source.url.startsWith("file://");
+  const fileName = isFile ? source.url.replace("file://", "").trim() : "";
+  const fileDownloadUrl = isFile ? `${API_URL}/files/${encodeURIComponent(fileName)}` : source.url;
+
+  const typeIcon = source.type === "image" ? "🖼️" : isWebUrl ? "🌐" : "📄";
+
+  return (
+    <div
+      className={`rounded-xl border transition-all text-xs overflow-hidden ${
+        dark
+          ? "bg-[#282828] border-white/10 hover:border-white/20"
+          : "bg-gray-50 border-gray-200 hover:border-gray-300"
+      }`}
+    >
+      <div className="flex items-center justify-between px-3 py-2 gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-sm flex-shrink-0">{typeIcon}</span>
+          <div className="truncate">
+            <span className={`font-semibold ${dark ? "text-white/90" : "text-gray-900"}`}>
+              {source.doc || "Document"}
+            </span>
+            {source.section && (
+              <span className={`ml-1.5 opacity-60 ${dark ? "text-white" : "text-gray-700"}`}>
+                • {source.section}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          {source.snippet && (
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className={`px-2 py-0.5 rounded text-[11px] font-medium border transition-all ${
+                expanded
+                  ? dark
+                    ? "bg-blue-500/20 border-blue-500/40 text-blue-400"
+                    : "bg-blue-50 border-blue-200 text-blue-600"
+                  : dark
+                  ? "bg-white/5 border-white/10 text-white/70 hover:bg-white/10"
+                  : "bg-white border-gray-200 text-gray-600 hover:bg-gray-100"
+              }`}
+            >
+              {expanded ? "Hide Quote" : "View Excerpt"}
+            </button>
+          )}
+
+          {isWebUrl && (
+            <a
+              href={source.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`px-2 py-0.5 rounded text-[11px] font-medium border flex items-center gap-1 transition-all ${
+                dark
+                  ? "bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20"
+                  : "bg-blue-50 border-blue-200 text-blue-600 hover:bg-blue-100"
+              }`}
+              title={source.url}
+            >
+              <span>Visit Link</span>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                <polyline points="15 3 21 3 21 9" />
+                <line x1="10" y1="14" x2="21" y2="3" />
+              </svg>
+            </a>
+          )}
+
+          {isFile && fileName && (
+            <a
+              href={fileDownloadUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              download={fileName}
+              className={`px-2 py-0.5 rounded text-[11px] font-medium border flex items-center gap-1 transition-all ${
+                dark
+                  ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20"
+                  : "bg-emerald-50 border-emerald-200 text-emerald-600 hover:bg-emerald-100"
+              }`}
+              title={`Download or view ${fileName}`}
+            >
+              <span>Download File</span>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+            </a>
+          )}
+        </div>
+      </div>
+
+      {expanded && source.snippet && (
+        <div
+          className={`px-3 py-2 border-t font-mono text-[11px] leading-relaxed transition-all ${
+            dark
+              ? "bg-[#1f1f1f] border-white/5 text-white/80"
+              : "bg-white border-gray-100 text-gray-700"
+          }`}
+        >
+          <div className="text-[10px] uppercase font-bold tracking-wider mb-1 opacity-50">
+            Source Excerpt / Match:
+          </div>
+          &ldquo;{source.snippet}&rdquo;
+        </div>
+      )}
     </div>
   );
 }
@@ -79,26 +194,27 @@ export default function MessageBubble({ message, dark, onRegenerate, isLoading }
         )}
       </div>
 
-      {/* Sources */}
+      {/* Rich Sources & Citations */}
       {isBot && !message.loading && message.sources && message.sources.length > 0 && (
-        <div className="pl-9 mt-2 flex flex-col gap-1">
-          {message.sources.filter(s => s.url).map((s, i) => (
-            <a key={i} href={s.url} target="_blank" rel="noopener noreferrer"
-              className="text-xs text-blue-500 hover:underline opacity-80 hover:opacity-100 transition-opacity break-all">
-              📎 {s.section ? `${s.section} — ` : ""}{s.doc || s.text || "Source"}
-            </a>
-          ))}
+        <div className="pl-9 mt-3 flex flex-col gap-2">
+          <div className={`text-[11px] font-bold uppercase tracking-wider ${dark ? "text-white/40" : "text-gray-400"}`}>
+            Verified Citations ({message.sources.length})
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {message.sources.map((source, i) => (
+              <CitationCard key={i} source={source} dark={dark} />
+            ))}
+          </div>
         </div>
       )}
 
-
-      {/* Actions — show on every bot message */}
+      {/* Actions */}
       {isBot && !message.loading && message.content && (
-        <div className="pl-9 mt-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="pl-9 mt-2.5 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
           {/* Copy */}
           <button
             onClick={copy}
-            title="Copy"
+            title="Copy response"
             className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg border transition-all active:scale-95 ${
               copied
                 ? "border-green-500 text-green-500"

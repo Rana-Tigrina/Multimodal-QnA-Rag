@@ -20,6 +20,8 @@ export default function Home() {
     sendQuestion,
     regenerate,
     clearChat,
+    selectedModel,
+    setSelectedModel,
   } = useChat();
 
   return (
@@ -34,6 +36,8 @@ export default function Home() {
         clearChat={clearChat}
         docCount={documents.length}
         onOpenModal={() => setIsModalOpen(true)}
+        selectedModel={selectedModel}
+        setSelectedModel={setSelectedModel}
       />
       <ChatWindow
         messages={messages}
